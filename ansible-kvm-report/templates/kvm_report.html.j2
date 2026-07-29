@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>KVM guest resource report</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --page: #f3f6f8;
+      --card: #ffffff;
+      --ink: #17212b;
+      --muted: #66717d;
+      --line: #dce3e8;
+      --accent: #176b87;
+      --running: #237a4b;
+      --stopped: #7b8490;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--page);
+      line-height: 1.45;
+    }
+    main {
+      width: min(860px, calc(100% - 32px));
+      margin: 48px auto;
+    }
+    .report-header { margin-bottom: 28px; }
+    h1 { margin: 0 0 8px; font-size: clamp(1.8rem, 5vw, 2.7rem); line-height: 1.1; }
+    .subtitle { margin: 0; color: var(--muted); }
+    .host {
+      margin: 0 0 34px;
+    }
+    .host-heading {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 16px;
+      margin: 0 0 14px;
+      padding-bottom: 10px;
+      border-bottom: 2px solid var(--accent);
+    }
+    .host-heading h2 { margin: 0; font-size: 1.3rem; }
+    .host-heading span { color: var(--muted); font-size: .92rem; white-space: nowrap; }
+    .vm-list {
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .vm-card {
+      padding: 22px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--card);
+      box-shadow: 0 2px 8px rgba(23, 33, 43, .04);
+      break-inside: avoid;
+    }
+    .vm-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+    .vm-title h3 { margin: 0; font-size: 1.18rem; overflow-wrap: anywhere; }
+    .state {
+      display: inline-block;
+      padding: 4px 9px;
+      border-radius: 999px;
+      color: #fff;
+      background: var(--stopped);
+      font-size: .76rem;
+      font-weight: 700;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+    .state.running { background: var(--running); }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin: 0 0 18px;
+    }
+    .metric {
+      padding: 12px;
+      border-radius: 8px;
+      background: #f4f8fa;
+    }
+    .metric dt { color: var(--muted); font-size: .78rem; font-weight: 650; text-transform: uppercase; }
+    .metric dd { margin: 4px 0 0; font-size: 1.08rem; font-weight: 750; }
+    .disk-title { margin: 0 0 8px; font-size: .82rem; color: var(--muted); text-transform: uppercase; }
+    .disk-list { margin: 0; padding: 0; list-style: none; }
+    .disk-list li {
+      display: grid;
+      grid-template-columns: minmax(70px, .5fr) minmax(100px, .7fr) minmax(0, 2fr);
+      gap: 10px;
+      padding: 8px 0;
+      border-top: 1px solid var(--line);
+      font-size: .9rem;
+    }
+    .disk-source { color: var(--muted); overflow-wrap: anywhere; }
+    .empty, .warning {
+      padding: 18px;
+      border: 1px dashed var(--line);
+      border-radius: 10px;
+      color: var(--muted);
+      background: var(--card);
+    }
+    .warning { margin-top: 14px; border-color: #d9a441; color: #765b1b; background: #fffaf0; }
+    footer { margin-top: 32px; color: var(--muted); font-size: .82rem; text-align: center; }
+    @media (max-width: 620px) {
+      main { width: min(100% - 20px, 860px); margin: 24px auto; }
+      .metrics { grid-template-columns: 1fr; }
+      .disk-list li { grid-template-columns: 70px 90px minmax(0, 1fr); font-size: .8rem; }
+      .vm-card { padding: 17px; }
+    }
+    @media print {
+      body { background: #fff; }
+      main { width: 100%; margin: 0; }
+      .vm-card { box-shadow: none; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header class="report-header">
+      <h1>KVM guest resources</h1>
+      <p class="subtitle">CPU, assigned memory, and virtual disk capacity for every configured guest.</p>
+    </header>
+
+{% for inventory_host in report_hosts %}
+{% set host_report = hostvars[inventory_host].kvm_report_data %}
+    <section class="host">
+      <div class="host-heading">
+        <h2>{{ host_report.hostname | e }}</h2>
+        <span>{{ host_report.guest_count }} guest{% if host_report.guest_count != 1 %}s{% endif %}</span>
+      </div>
+
+{% if host_report.guests %}
+      <div class="vm-list">
+{% for vm in host_report.guests %}
+        <article class="vm-card">
+          <div class="vm-title">
+            <h3>{{ vm.name | e }}</h3>
+            <span class="state{% if vm.state | lower == 'running' %} running{% endif %}">{{ vm.state | e }}</span>
+          </div>
+
+          <dl class="metrics">
+            <div class="metric">
+              <dt>Virtual CPUs</dt>
+              <dd>{{ vm.vcpus }}</dd>
+            </div>
+            <div class="metric">
+              <dt>Memory</dt>
+              <dd>{{ vm.memory_human | e }}</dd>
+            </div>
+            <div class="metric">
+              <dt>Total disk</dt>
+              <dd>{{ vm.total_disk_human | e }}</dd>
+            </div>
+          </dl>
+
+          <h4 class="disk-title">Virtual disks</h4>
+{% if vm.disks %}
+          <ul class="disk-list">
+{% for disk in vm.disks %}
+            <li>
+              <strong>{{ disk.target | e }}</strong>
+              <span>{{ disk.capacity_human | e }}</span>
+              <span class="disk-source">{{ disk.source | e }}</span>
+            </li>
+{% endfor %}
+          </ul>
+{% else %}
+          <div class="empty">No virtual disks are attached.</div>
+{% endif %}
+        </article>
+{% endfor %}
+      </div>
+{% else %}
+      <div class="empty">No configured KVM guests were found on this host.</div>
+{% endif %}
+
+{% if host_report.errors %}
+      <div class="warning">
+        Could not inspect {{ host_report.errors | length }} guest{% if host_report.errors | length != 1 %}s{% endif %}:
+{% for error in host_report.errors %}
+        {{ error.guest | e }}{% if not loop.last %}, {% endif %}
+{% endfor %}
+      </div>
+{% endif %}
+    </section>
+{% endfor %}
+
+    <footer>
+      Generated {{ now(utc=true, fmt='%Y-%m-%d %H:%M UTC') }} · Source: libvirt via virsh
+    </footer>
+  </main>
+</body>
+</html>

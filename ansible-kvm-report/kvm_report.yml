@@ -1,0 +1,56 @@
+---
+- name: Collect KVM guest resources
+  hosts: kvm_hosts
+  become: true
+  gather_facts: true
+
+  vars:
+    libvirt_uri: "qemu:///system"
+
+  tasks:
+    - name: Check that virsh is available
+      ansible.builtin.command:
+        argv:
+          - virsh
+          - --version
+      register: virsh_version
+      changed_when: false
+
+    - name: Collect guest CPU, memory, and disk information
+      ansible.builtin.script:
+        cmd: "files/collect_kvm_guests.py --uri {{ libvirt_uri | quote }}"
+        executable: python3
+      register: kvm_guest_collection
+      changed_when: false
+
+    - name: Store this host's report data
+      ansible.builtin.set_fact:
+        kvm_report_data: "{{ kvm_guest_collection.stdout | from_json }}"
+
+- name: Render the combined KVM guest report
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    report_output_path: "{{ playbook_dir }}/output/kvm-guests.html"
+
+  tasks:
+    - name: Create the report output directory
+      ansible.builtin.file:
+        path: "{{ report_output_path | dirname }}"
+        state: directory
+        mode: "0755"
+
+    - name: Render the single-column HTML report
+      ansible.builtin.template:
+        src: templates/kvm_report.html.j2
+        dest: "{{ report_output_path }}"
+        mode: "0644"
+      vars:
+        report_hosts: "{{ groups['kvm_hosts'] }}"
+
+    - name: Show the report location
+      ansible.builtin.debug:
+        msg: "KVM guest report written to {{ report_output_path }}"
