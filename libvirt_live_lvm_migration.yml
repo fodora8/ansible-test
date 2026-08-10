@@ -1,0 +1,234 @@
+---
+# Live-migrate raw LVM-backed libvirt disks, one disk at a time.
+#
+# Run from a control host against the hypervisor(s), for example:
+#   ansible-playbook -i inventory.ini libvirt_live_lvm_migration.yml \
+#     -e @migration-vars.yml -e confirm_migration=true
+#
+# The guest becomes transient after 'virsh undefine' and MUST NOT be stopped
+# until this playbook has successfully defined the final XML.
+
+- name: Live-migrate libvirt guest disks between LVM logical volumes
+  hosts: libvirt_hosts
+  become: true
+  gather_facts: false
+  serial: 1
+
+  vars:
+    # Required input. Keep one playbook invocation to one VM per host.
+    migration_vm: migtest
+
+    # The target names must match virsh domblklist output exactly.
+    migration_disks:
+      - target: vde
+        source: /dev/mapper/old_migtest_os
+        destination: /dev/mapper/new_migtest_os
+      - target: vdf
+        source: /dev/mapper/old_migtest_gen
+        destination: /dev/mapper/new_migtest_gen
+      - target: vdg
+        source: /dev/mapper/old_migtest_data
+        destination: /dev/mapper/new_migtest_data
+      - target: vdh
+        source: /dev/mapper/old_migtest_check
+        destination: /dev/mapper/new_migtest_check
+
+    # A deliberate opt-in protects against an accidental playbook run.
+    confirm_migration: false
+    migration_state_root: /var/lib/libvirt/migrations
+
+  pre_tasks:
+    - name: Require explicit confirmation
+      ansible.builtin.assert:
+        that:
+          - confirm_migration | bool
+          - migration_vm | length > 0
+          - migration_disks | length > 0
+        fail_msg: >-
+          Refusing to migrate. Pass -e confirm_migration=true only after
+          reviewing the VM, source LVs, and destination LVs.
+
+    - name: Verify the VM is running
+      ansible.builtin.command:
+        argv: [virsh, domstate, --reason, "{{ migration_vm }}"]
+      register: vm_state
+      changed_when: false
+      failed_when: vm_state.rc != 0 or 'running' not in vm_state.stdout
+
+    - name: Verify the VM is currently persistent
+      ansible.builtin.command:
+        argv: [virsh, dominfo, "{{ migration_vm }}"]
+      register: vm_info
+      changed_when: false
+      failed_when: "vm_info.rc != 0 or 'Persistent:' not in vm_info.stdout or 'yes' not in vm_info.stdout"
+
+    - name: Get current block device mapping
+      ansible.builtin.command:
+        argv: [virsh, domblklist, "{{ migration_vm }}", --details]
+      register: block_list_before
+      changed_when: false
+
+    - name: Verify every source LV is attached to the expected target
+      ansible.builtin.assert:
+        that:
+          - "block_list_before.stdout is search('\\s' ~ item.target ~ '\\s+' ~ item.source)"
+          - item.source != item.destination
+        fail_msg: >-
+          {{ migration_vm }} does not show {{ item.target }} at {{ item.source }},
+          or its source and destination are identical. Stop and correct the manifest.
+      loop: "{{ migration_disks }}"
+      loop_control:
+        label: "{{ item.target }}"
+
+    - name: Inspect source and destination LV paths
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: >-
+        {{ migration_disks | map(attribute='source') | list
+           + migration_disks | map(attribute='destination') | list }}
+      register: lv_paths
+      changed_when: false
+
+    - name: Require all sources and destinations to be block devices
+      ansible.builtin.assert:
+        that: item.stat.exists and item.stat.isblk
+        fail_msg: "{{ item.item }} is missing or is not a block device."
+      loop: "{{ lv_paths.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Check destination capacity against its source
+      ansible.builtin.command:
+        argv: [blockdev, --getsize64, "{{ item.destination }}"]
+      register: destination_sizes
+      changed_when: false
+      loop: "{{ migration_disks }}"
+      loop_control:
+        label: "{{ item.target }} destination"
+
+    - name: Check source capacity
+      ansible.builtin.command:
+        argv: [blockdev, --getsize64, "{{ item.source }}"]
+      register: source_sizes
+      changed_when: false
+      loop: "{{ migration_disks }}"
+      loop_control:
+        label: "{{ item.target }} source"
+
+    - name: Require each destination to be at least as large as its source
+      ansible.builtin.assert:
+        that: (destination_sizes.results[ansible_loop.index0].stdout | int) >= (item.stdout | int)
+        fail_msg: >-
+          Destination {{ migration_disks[ansible_loop.index0].destination }} is smaller
+          than source {{ migration_disks[ansible_loop.index0].source }}.
+      loop: "{{ source_sizes.results }}"
+      loop_control:
+        extended: true
+        label: "{{ migration_disks[ansible_loop.index0].target }}"
+
+  tasks:
+    - name: Set per-run state directory
+      ansible.builtin.set_fact:
+        migration_state_dir: "{{ migration_state_root }}/{{ migration_vm }}-{{ lookup('pipe', 'date +%Y%m%dT%H%M%S') }}"
+
+    - name: Create per-run state directory
+      ansible.builtin.file:
+        path: "{{ migration_state_dir }}"
+        state: directory
+        mode: '0700'
+
+    - name: Record original inactive XML
+      ansible.builtin.command:
+        argv: [virsh, dumpxml, --inactive, "{{ migration_vm }}"]
+      register: original_xml
+      changed_when: false
+
+    - name: Save original inactive XML
+      ansible.builtin.copy:
+        content: "{{ original_xml.stdout }}\n"
+        dest: "{{ migration_state_dir }}/{{ migration_vm }}.before.xml"
+        mode: '0600'
+
+    - name: Record initial disk mapping and VM information
+      ansible.builtin.copy:
+        content: |
+          {{ block_list_before.stdout }}
+
+          {{ vm_info.stdout }}
+        dest: "{{ migration_state_dir }}/before.txt"
+        mode: '0600'
+
+    - name: Make the running VM transient (no storage is removed)
+      ansible.builtin.command:
+        argv: [virsh, undefine, "{{ migration_vm }}"]
+      register: undefine_result
+      changed_when: undefine_result.rc == 0
+
+    - name: Copy and pivot each disk serially
+      ansible.builtin.command:
+        argv:
+          - virsh
+          - blockcopy
+          - "{{ migration_vm }}"
+          - "{{ item.target }}"
+          - "{{ item.destination }}"
+          - --blockdev
+          - --raw
+          - --wait
+          - --verbose
+          - --pivot
+      loop: "{{ migration_disks }}"
+      loop_control:
+        label: "{{ item.target }} -> {{ item.destination }}"
+      register: blockcopy_results
+      changed_when: true
+
+    - name: Record final live disk mapping
+      ansible.builtin.command:
+        argv: [virsh, domblklist, "{{ migration_vm }}", --details]
+      register: block_list_after
+      changed_when: false
+
+    - name: Verify every target now uses its intended destination
+      ansible.builtin.assert:
+        that: item.destination in block_list_after.stdout
+        fail_msg: >-
+          {{ item.target }} was not verified at {{ item.destination }} after pivot.
+      loop: "{{ migration_disks }}"
+      loop_control:
+        label: "{{ item.target }}"
+
+    - name: Dump final live XML
+      ansible.builtin.command:
+        argv: [virsh, dumpxml, "{{ migration_vm }}"]
+      register: final_xml
+      changed_when: false
+
+    - name: Save final live XML
+      ansible.builtin.copy:
+        content: "{{ final_xml.stdout }}\n"
+        dest: "{{ migration_state_dir }}/{{ migration_vm }}.after.xml"
+        mode: '0600'
+
+    - name: Define and validate final persistent XML
+      ansible.builtin.command:
+        argv: [virsh, define, --validate, "{{ migration_state_dir }}/{{ migration_vm }}.after.xml"]
+      changed_when: true
+
+    - name: Restore enabled autostart
+      ansible.builtin.command:
+        argv: [virsh, autostart, "{{ migration_vm }}"]
+      changed_when: true
+      when: "vm_info.stdout is search('Autostart:\\s+enable')"
+
+    - name: Restore disabled autostart
+      ansible.builtin.command:
+        argv: [virsh, autostart, --disable, "{{ migration_vm }}"]
+      changed_when: true
+      when: "vm_info.stdout is search('Autostart:\\s+disable')"
+
+    - name: Save final mapping
+      ansible.builtin.copy:
+        content: "{{ block_list_after.stdout }}\n"
+        dest: "{{ migration_state_dir }}/after.txt"
+        mode: '0600'

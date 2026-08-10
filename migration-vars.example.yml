@@ -1,0 +1,19 @@
+---
+# Copy this file, change the values, then use it with:
+# ansible-playbook -i inventory.ini libvirt_live_lvm_migration.yml \
+#   -e @migration-vars.yml -e confirm_migration=true
+
+migration_vm: migtest
+migration_disks:
+  - target: vde
+    source: /dev/mapper/old_migtest_os
+    destination: /dev/mapper/new_migtest_os
+  - target: vdf
+    source: /dev/mapper/old_migtest_gen
+    destination: /dev/mapper/new_migtest_gen
+  - target: vdg
+    source: /dev/mapper/old_migtest_data
+    destination: /dev/mapper/new_migtest_data
+  - target: vdh
+    source: /dev/mapper/old_migtest_check
+    destination: /dev/mapper/new_migtest_check
