@@ -1,0 +1,69 @@
+---
+- name: Collect Tomcat versions
+  hosts: all
+  gather_facts: true
+  become: true
+
+  vars:
+    # This path is on the machine from which Ansible is run.
+    tomcat_report_path: "./tomcat_versions.csv"
+
+  tasks:
+    - name: Check for a running Tomcat and obtain its version
+      ansible.builtin.shell: |
+        set -o pipefail
+
+        pid="$(pgrep -f '[o]rg.apache.catalina.startup.Bootstrap' | head -n 1)"
+        if [ -z "$pid" ]; then
+          exit 0
+        fi
+
+        cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline")"
+        catalina_home="$(printf '%s\n' "$cmdline" | sed -n 's/.*-Dcatalina.home=\([^ ]*\).*/\1/p')"
+        catalina_base="$(printf '%s\n' "$cmdline" | sed -n 's/.*-Dcatalina.base=\([^ ]*\).*/\1/p')"
+
+        for tomcat_home in "$catalina_home" "$catalina_base"; do
+          if [ -x "$tomcat_home/bin/version.sh" ]; then
+            "$tomcat_home/bin/version.sh" 2>&1 \
+              | sed -n 's/^Server version:[[:space:]]*//p' \
+              | head -n 1
+            exit 0
+          fi
+        done
+
+        # Fallback when version.sh is unavailable but catalina.jar is readable.
+        if [ -r "$catalina_home/lib/catalina.jar" ]; then
+          java -cp "$catalina_home/lib/catalina.jar" \
+            org.apache.catalina.util.ServerInfo 2>&1 \
+            | sed -n 's/^Server version:[[:space:]]*//p' \
+            | head -n 1
+        fi
+      args:
+        executable: /bin/bash
+      register: tomcat_version_command
+      changed_when: false
+      failed_when: false
+
+    - name: Save report values for this host
+      ansible.builtin.set_fact:
+        report_hostname: "{{ ansible_fqdn | default(ansible_hostname) | default(inventory_hostname) }}"
+        report_os_version: >-
+          {{ ansible_distribution ~ ' ' ~ ansible_distribution_version }}
+        report_tomcat_version: >-
+          {{ (tomcat_version_command.stdout | trim) if
+             (tomcat_version_command.stdout | trim | length > 0)
+             else 'Not running' }}
+
+    - name: Write the consolidated CSV report on the Ansible controller
+      ansible.builtin.copy:
+        dest: "{{ tomcat_report_path }}"
+        mode: "0644"
+        content: |
+          "hostname","os_version","tomcat_version"
+          {% for host in ansible_play_hosts %}
+          "{{ hostvars[host].report_hostname | replace('"', '""') }}","{{ hostvars[host].report_os_version | replace('"', '""') }}","{{ hostvars[host].report_tomcat_version | replace('"', '""') }}"
+          {% endfor %}
+      delegate_to: localhost
+      become: false
+      run_once: true
+
